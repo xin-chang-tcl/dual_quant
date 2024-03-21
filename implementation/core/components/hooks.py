@@ -3,7 +3,7 @@ from pingpong_quant.implementation.core.components.pingpong_quantizer import Pin
 
 def dual_loss_hook_fn(loss_values, module, input):
     if module.init_scales:
-        clip_value, round_value = module.compute_dual_loss(input[0])
+        clip_value, round_value = module.compute_reg_loss(input[0])
         if module.is_per_channel:
             loss_values.append([clip_value, round_value,0])
         else:

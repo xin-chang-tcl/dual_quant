@@ -145,11 +145,7 @@ class PingPongQuantizer(FakeQuantizeBase):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
 
-    def compute_dual_loss(self, X):
-        if len(X.shape) == 2:
-            flag = True
-        else:
-            flag = False
+    def compute_reg_loss(self, X):
         if self.is_per_channel:
             ch_axis = self.activation_post_process.ch_axis
             # compute the scale and zero-point per channel
@@ -193,8 +189,6 @@ class PingPongQuantizer(FakeQuantizeBase):
         loss_left = torch.sum(X_clip_left)
         loss_right = torch.sum(X_clip_right)
         loss_round = torch.sum(X_round)
-        if flag:
-            loss_round = 0
         return (loss_right+loss_left)/torch.prod(torch.tensor(X.shape)), loss_round/torch.prod(torch.tensor(X.shape))
 
     def forward_finetune(self, X):

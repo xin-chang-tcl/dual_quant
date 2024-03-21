@@ -14,11 +14,7 @@ The dual regualarization is implemented in the `compute_dual_loss` function:
 
 
 ```python
-    def compute_dual_loss(self, X):
-        if len(X.shape) == 2:
-            flag = True
-        else:
-            flag = False
+    def compute_reg_loss(self, X):
         if self.is_per_channel:
             ch_axis = self.activation_post_process.ch_axis
             # compute the scale and zero-point per channel
@@ -62,20 +58,8 @@ The dual regualarization is implemented in the `compute_dual_loss` function:
         loss_left = torch.sum(X_clip_left)
         loss_right = torch.sum(X_clip_right)
         loss_round = torch.sum(X_round)
-        if flag:
-            loss_round = 0
         return (loss_right+loss_left)/torch.prod(torch.tensor(X.shape)), loss_round/torch.prod(torch.tensor(X.shape))
 ```
-
-Note that there is a special flag, we do take into account rounding loss for Linear Layers, here is just a hacky solution.
-```python
-    def compute_dual_loss(self, X):
-        if len(X.shape) == 2:
-            flag = True
-        else:
-            flag = False
-```
-
 
 The functions listed below are used to initialize the scale parameters for training,
 The lowest_scale parameters and clipping are used for converting to TFlite purpose, as
@@ -92,7 +76,7 @@ boundaries are preset, however, it doesn't affect the pytorch metrics.
 `init_grad_scaling` 
 Basically makes the scale parameters trainable, in this implementation, we used sigmoid function
 to make sure that the scale parameters are in the range of (0,1), it can avoid a lot of numerical issues
-than clipping solution.
+that might appear in clipping solution.
 
 ```python
     def modify_forward(self):

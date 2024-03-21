@@ -41,6 +41,10 @@ def get_insert_fake_quant_model(model, dummy_input_shape, config, val_dataloader
     quant_model = quantizer.quantize()
     quant_model.eval()
     for layer in quant_model.modules():
+        if isinstance(layer, torch.ao.nn.qat.modules.linear.Linear):
+            for module in layer.modules():
+                if isinstance(module, PingPongQuantizer):
+                    module.not_used = True
         if isinstance(layer, PingPongQuantizer):
             if layer.observer_enabled == 0 and layer.fake_quant_enabled == 0:
                 layer.not_used = True
