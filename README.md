@@ -174,6 +174,7 @@ if __name__ == '__main__':
     dual_loss = []
     for hook in hook_loss:
         hook.remove()
+    #backpropagation
 ```
 Note that during evaluation, the observers needs to be turned off, to not contaminate the zeropoint calculation.
 Use:
@@ -219,5 +220,7 @@ The example model checkpoints are listed in `model_checkpoints` folder. For conv
 we only listed the most important models that can be directly loaded as shown above.
 Some other float32 pretrained weights are discarded in the recent pytorch version.
 
+The models can also be converted to TFlite using TinyNN features, we experienced exact same performance in TFlite 
+evaluation after the conversion.
 After the accpetance of the paper, we will provide more models with our own tools handing
 different models from timm, etc.

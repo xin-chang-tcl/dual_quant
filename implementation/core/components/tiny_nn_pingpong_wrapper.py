@@ -196,7 +196,6 @@ class PingPongwrapper(QATQuantizer):
                             'Conv1d',
                             'ConvBnReLU1d',
                             'ConvBn1d',
-                            'Linear',
                     ):
                         m.qconfig = qconfig_c
                     else:

@@ -41,6 +41,7 @@ def get_insert_fake_quant_model(model, dummy_input_shape, config, val_dataloader
     quant_model = quantizer.quantize()
     quant_model.eval()
     for layer in quant_model.modules():
+        #We do not make training of scales for Linear layers
         if isinstance(layer, torch.ao.nn.qat.modules.linear.Linear):
             for module in layer.modules():
                 if isinstance(module, PingPongQuantizer):
