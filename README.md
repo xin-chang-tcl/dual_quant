@@ -1,14 +1,19 @@
 ## CONTENT 
-This repository contains the PyTorch implementation for quantization using TinyNN for converting the results.
+This repository contains the PyTorch implementation for
+
+**Dynamic Data-Driven Quantization Range
+Pinpointing: A Ping Pong Ball Approach for
+Precision Adjustments** 
+
 
 ## Algorithm implementation
-The algorithm is implemented in the class PingPongQuantizer at `implementation/core/components/pingpong_quantizer.py`
+The algorithm is implemented in the `class PingPongQuantizer` at `implementation/core/components/pingpong_quantizer.py`
 
 We exploits TinyNN to prepare the quantizer inserted model because it provides better graph operations, and it supports
-the convertion to TFlite. The implementation here, to align with the pytorch implementation, doesn't support such conversion feature.
+the convertion to TFlite. 
 
 The class inherits from the base `class FakeQuantizeBase`, which is the base class for PTQ/QAT purpose from pytorch.
-The dual regualarization is implemented in the `compute_dual_loss` function:
+The dual regualarization is implemented in the `compute_reg_loss` function:
 
 
 
@@ -62,8 +67,8 @@ The dual regualarization is implemented in the `compute_dual_loss` function:
 ```
 
 The functions listed below are used to initialize the scale parameters for training,
-The lowest_scale parameters and clipping are used for converting to TFlite purpose, as
-special outputs for TFlite conversion might experience some numerical issues. Thus some
+The `lowest_scale` parameter are used for converting to TFlite purpose, as
+special outputs for TFlite conversion might experience some numerical issues. Some
 boundaries are preset, however, it doesn't affect the pytorch metrics.
 ```python
     def init_grad_scaling(self):
@@ -105,7 +110,7 @@ that might appear in clipping solution.
         self.calculate_qparams = self.calculate_saving
         self.forward = self.forward_finetune
 ```
-The functions above mostly control the conversion to scales, since during training they are converted, we will need to convert
+The functions above mostly control the conversion of scales, since during training they are converted, we will need to convert
 them back to the original scales for Pytorch or TFlite conversion purpose.
 
 ## ImageNet Example
@@ -219,8 +224,8 @@ Then the model is ready for evaluation in the original ImageNet pipeline.
 The example model checkpoints are listed in `model_checkpoints` folder. For convience,
 we only listed the most important models that can be directly loaded as shown above.
 Some other float32 pretrained weights are discarded in the recent pytorch version.
+After the accpetance of the paper, we will provide more models with our own tools handing
+different models from timm, etc.
 
 The models can also be converted to TFlite using TinyNN features, we experienced exact same performance in TFlite 
 evaluation after the conversion.
-After the accpetance of the paper, we will provide more models with our own tools handing
-different models from timm, etc.

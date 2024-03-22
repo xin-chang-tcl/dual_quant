@@ -2,7 +2,6 @@ from tinynn.graph.quantization.quantizer import QATQuantizer
 import torch.nn as nn
 import typing
 import queue
-import timm
 import torch.nn.intrinsic as nni
 from tinynn.util.train_util import get_logger, get_module_device
 from tinynn.graph.tracer import TraceGraph
@@ -52,27 +51,6 @@ if LooseVersion(torch.__version__) >= '1.13.0':
     from tinynn.graph.quantization.quantizable.gru import GRU
 
     FUSE_QAT_MODULES_CUSTOM.update({nn.GRU: GRU})
-
-
-def replace_layers(model):
-    for name, module in model.named_children():
-        if isinstance(module, timm.layers.linear.Linear):
-
-            # Create a new layer
-            new_layer = nn.Linear(module.in_features, module.out_features)
-            new_layer.weight = module.weight
-            new_layer.bias = module.bias
-
-            # Replace the old layer with the new layer
-            setattr(model, name, new_layer)
-        elif isinstance(module, torch.ao.nn.quantized.modules.functional_modules.FloatFunctional):
-            module.mul_scalar = module.mul
-            module.add_scalar = module.add
-        elif isinstance(module, timm.layers.LayerNorm2d):
-            pass
-        else:
-            # Recursively apply this function to child modules
-            replace_layers(module)
 
 
 class PingPongwrapper(QATQuantizer):
@@ -295,7 +273,6 @@ class PingPongwrapper(QATQuantizer):
 
             torch_q.convert(model, mapping, inplace=True)
         else:
-            replace_layers(graph.module)
             torch_q.propagate_qconfig_(graph.module, qconfig_dict=None)
             for m in non_quantized_mods:
                 if hasattr(m, "qconfig"):
