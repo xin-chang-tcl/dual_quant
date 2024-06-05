@@ -1,4 +1,4 @@
-from pingpong_quant.implementation.core.components.pingpong_quantizer import PingPongQuantizer
+from dual_quant.implementation.core.components.dual_quantizer import DualQuantizer
 
 
 def get_parameters(model, config):

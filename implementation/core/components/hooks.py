@@ -1,4 +1,4 @@
-from pingpong_quant.implementation.core.components.pingpong_quantizer import PingPongQuantizer
+from dual_quant.implementation.core.components.dual_quantizer import DualQuantizer
 
 
 def dual_loss_hook_fn(loss_values, module, input):
@@ -13,7 +13,7 @@ def dual_loss_hook_fn(loss_values, module, input):
 def register_hooks_dual_loss(model, hook_fn, loss_values):
     hooks = []
     for layer1 in model.modules():
-        if isinstance(layer1, PingPongQuantizer):
+        if isinstance(layer1, DualQuantizer):
             def dual_loss_hook_fn(module, input, output, hook_fn=hook_fn, loss_values=loss_values):
                 hook_fn(loss_values, module, input)
 

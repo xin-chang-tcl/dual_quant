@@ -1,7 +1,6 @@
-from pingpong_quant.implementation.core.utils.model_utils import get_insert_fake_quant_model
+from dual_quant.implementation.core.utils.model_utils import get_insert_fake_quant_model
 import torchvision
 from torch.quantization.quantize_fx import fuse_fx
-from pingpong_quant.implementation.core.components.pingpong_quantizer import prepare_for_convert
 if __name__ == '__main__':
     config = {
         'per_channel': True,

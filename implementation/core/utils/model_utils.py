@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from pingpong_quant.implementation.core.components.tiny_nn_pingpong_wrapper import PingPongwrapper
-from pingpong_quant.implementation.core.components.pingpong_quantizer import PingPongQuantizer
-from pingpong_quant.implementation.core.components.pingpong_quantizer import prepare_for_convert, init_grad_scaling, disable_grad_scaling
+from dual_quant.implementation.core.components.tiny_nn_dual_wrapper import PingPongwrapper
+from dual_quant.implementation.core.components.dual_quantizer import DualQuantizer
+from dual_quant.implementation.core.components.dual_quantizer import prepare_for_convert, init_grad_scaling, disable_grad_scaling
 
 
 def replace_inplace(model):
@@ -21,7 +21,7 @@ def replace_inplace(model):
             replace_inplace(child)
 
 
-def get_insert_fake_quant_model(model, dummy_input_shape, config, val_dataloader=None):
+def get_insert_fake_quant_model(model, dummy_input_shape, config):
     replace_inplace(model)
     path = 'quant_out'
     dummy_input = torch.randn(dummy_input_shape)
@@ -44,17 +44,14 @@ def get_insert_fake_quant_model(model, dummy_input_shape, config, val_dataloader
         #We do not make training of scales for Linear layers
         if isinstance(layer, torch.ao.nn.qat.modules.linear.Linear):
             for module in layer.modules():
-                if isinstance(module, PingPongQuantizer):
+                if isinstance(module, DualQuantizer):
                     module.not_used = True
-        if isinstance(layer, PingPongQuantizer):
+        if isinstance(layer, DualQuantizer):
             if layer.observer_enabled == 0 and layer.fake_quant_enabled == 0:
                 layer.not_used = True
-    if val_dataloader is not None:
-        data = next(iter(val_dataloader))['inputs'][0, ::].unsqueeze(0).permute(0, 3, 1, 2)
-    else:
-        data = dummy_input
-    quant_model(data)
-    if config['weight_path'] is not None:
+
+    if config['weight_path'] is not None and config['training_type'] == 'convert':
+        quant_model(dummy_input)
         quant_model.apply(init_grad_scaling)
         quant_model.apply(disable_grad_scaling)
         quant_model.load_state_dict(torch.load(config['weight_path'], map_location=torch.device('cpu')))
