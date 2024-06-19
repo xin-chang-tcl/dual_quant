@@ -18,16 +18,8 @@ def get_parameters(model, config):
             ori_weights.append(param)
     group1 = scale_parameters
     group2 = ori_weights
-    if config['training_type'] == 'qat':
-        param_list = {'model_params': group2, 'scale_params': group1}
-    else:
-        ####For PTQ only, we train only the scale parameters, however its possible to train the whole model as shown above.
-        param_list = group1
-        for p in model.parameters():
-            if id(p) in scale_parameters_id:
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
+    param_list = {'model_params': group2, 'scale_params': group1}
+
     return param_list
 
 
