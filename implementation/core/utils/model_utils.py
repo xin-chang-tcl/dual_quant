@@ -21,7 +21,7 @@ def replace_inplace(model):
             replace_inplace(child)
 
 
-def get_insert_fake_quant_model(model, dummy_input_shape, config):
+def get_insert_fake_quant_model(model, dummy_input_shape, config, ignore_layer_names=[]):
     replace_inplace(model)
     path = 'quant_out'
     dummy_input = torch.randn(dummy_input_shape)
@@ -40,22 +40,23 @@ def get_insert_fake_quant_model(model, dummy_input_shape, config):
 
     quant_model = quantizer.quantize()
     quant_model.eval()
-    for layer in quant_model.modules():
-        #We do not make training of scales for Linear layers
-        if isinstance(layer, torch.ao.nn.qat.modules.linear.Linear):
-            for module in layer.modules():
+    if ignore_layer_names != []:
+        for name in ignore_layer_names:
+            for module in quant_model._modules[name].modules():
                 if isinstance(module, DualQuantizer):
-                    module.not_used = True
-        if isinstance(layer, DualQuantizer):
-            if layer.observer_enabled == 0 and layer.fake_quant_enabled == 0:
-                layer.not_used = True
+                    if module.quant_min + module.quant_max != 0:
+                        module.not_used = True
 
-    if config['weight_path'] is not None and config['training_type'] == 'convert':
-        quant_model(dummy_input)
-        quant_model.apply(init_grad_scaling)
-        quant_model.apply(disable_grad_scaling)
-        quant_model.load_state_dict(torch.load(config['weight_path'], map_location=torch.device('cpu')))
-        quant_model.apply(prepare_for_convert)
+
+        #We do not make training of scales for Linear layers
+        # if isinstance(layer, torch.ao.nn.qat.modules.linear.Linear):
+        #     for module in layer.modules():
+        #         if isinstance(module, DualQuantizer):
+        #             module.not_used = True
+        # if isinstance(layer, DualQuantizer):
+        #     if layer.observer_enabled == 0 and layer.fake_quant_enabled == 0:
+        #         layer.not_used = True
+
     return quant_model
 
 

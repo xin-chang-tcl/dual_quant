@@ -7,7 +7,7 @@ def get_parameters(model, config):
     scale_parameters = []
     ori_weights = []
     for p in model.modules():
-        if isinstance(p, PingPongQuantizer):
+        if isinstance(p, DualQuantizer):
             if p.scale.requires_grad:
                 scale_parameters.append(p.scale)
                 scale_parameters_id.add(id(p.scale))
@@ -19,7 +19,7 @@ def get_parameters(model, config):
     group1 = scale_parameters
     group2 = ori_weights
     if config['training_type'] == 'qat':
-        param_list = group1+group2
+        param_list = {'model_params': group2, 'scale_params': group1}
     else:
         ####For PTQ only, we train only the scale parameters, however its possible to train the whole model as shown above.
         param_list = group1
