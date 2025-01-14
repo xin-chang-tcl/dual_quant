@@ -2,6 +2,73 @@ import torch
 from torch.ao.quantization.fake_quantize import FakeQuantizeBase
 from torch.ao.quantization.observer import MovingAverageMinMaxObserver
 import re
+import numpy as np
+
+
+def random_sample_channel_wise(X, num_samples):
+    # Get the shape of the input tensor
+    original_shape = X.shape
+
+    # Get the number of channels
+    num_channels = original_shape[1]
+
+    # Initialize a list to hold sampled data for each channel
+    sampled_channels = []
+
+    # Iterate over each channel
+    for c in range(num_channels):
+        # Flatten the channel data (excluding batch and channel dimensions)
+        channel_data = X[:, c, ...].contiguous().view(original_shape[0], -1)
+
+        # Generate random indices for the current channel, independently for each sample in the batch
+        indices = torch.randperm(channel_data.size(1))[:num_samples]
+
+        # Sample the data from the current channel using the same indices for all elements in the batch
+        sampled = channel_data[:, indices]
+
+        # Append the sampled data to the list
+        sampled_channels.append(sampled)
+
+    # Concatenate the sampled data along the channel dimension
+    sampled_tensor = torch.stack(sampled_channels, dim=1)
+
+    return sampled_tensor
+
+
+def sum_except_channel(tensor, channel_axis=1):
+    # Get the total number of dimensions
+    num_dims = tensor.dim()
+
+    # Create a list of dimensions to sum over, excluding the channel axis
+    sum_dims = [i for i in range(num_dims) if i != channel_axis]
+
+    # Sum over the specified dimensions
+    result = torch.sum(tensor, dim=sum_dims)
+
+    return result
+
+def detect_anomaly_normalized(data, threshold=0.9, scale=1.0):
+    """
+    Detects anomalies in normalized data based on standard deviation and returns a non-linear value.
+    Args:
+    - data (list, torch.Tensor): The input normalized data, expected to be in the range [0, 1].
+    - threshold (float): The threshold for standard deviation to consider the data uniform, relative to the normalized range.
+    - scale (float): A scaling factor for the output, relative to the normalized range.
+    Returns:
+    - float: A value based on the degree of anomaly detected.
+    """
+    # Ensure the data is a torch tensor for efficient computation
+    if not isinstance(data, torch.Tensor):
+        data = torch.tensor(data, dtype=torch.float32)
+    data = data/torch.max(data)
+    # Calculate the standard deviation of the data
+    std_dev = torch.std(data)
+    num = torch.sum(torch.where(data < threshold, 1, 0))
+    # if num > 0:
+    #     num_scale = data.shape[0] / num
+    # else:
+    num_scale = 1
+    return (torch.exp(1+std_dev) * scale * num_scale ** 3).item()
 
 
 def _is_per_channel(qscheme: 'torch.qscheme') -> bool:
@@ -20,7 +87,7 @@ class DualQuantizer(FakeQuantizeBase):
     scale: torch.Tensor
     zero_point: torch.Tensor
 
-    def __init__(self, init_scale=False, lowest_scale=1e-5, observer=MovingAverageMinMaxObserver, quant_min=None, quant_max=None, **observer_kwargs):
+    def __init__(self, init_scale=False, lowest_scale=1e-5, threshold=0.1, penalty_factor=0.05, observer=MovingAverageMinMaxObserver, quant_min=None, quant_max=None, **observer_kwargs):
         super().__init__()
         # Populate quant_min/quant_max to observer_kwargs if valid
         if quant_min is not None and quant_max is not None:
@@ -57,7 +124,18 @@ class DualQuantizer(FakeQuantizeBase):
         self.init_scales = init_scale
         self.lowest_scale = lowest_scale
         self.not_used = False
-
+        self.clip_penalty = 0.999999
+        self.clip = False
+        self.clip_min = None
+        self.clip_max = None
+        self.enhance = False
+        self.threshold = threshold
+        self.use_minmax = False
+        self.to_compute = True
+        self.penalty_factor = penalty_factor
+        self.record = True
+        self.scale_list = []
+        self.float = False
     @torch.jit.export
     def calculate_qparams(self):
         return self.activation_post_process.calculate_qparams()
@@ -71,8 +149,13 @@ class DualQuantizer(FakeQuantizeBase):
         return self.activation_post_process.calculate_qparams()
 
     def forward(self, X):
-        if (self.observer_enabled[0] == 1):
-            self.activation_post_process(X.detach())
+        if self.observer_enabled[0] == 1:
+            data = X.detach()
+            # if self.clip_min:
+            #     data = torch.clamp(data, self.clip_min)
+            # if self.clip_max:
+            #     data = torch.clamp(data, max=self.clip_max)
+            self.activation_post_process(data)
             _scale, _zero_point = self.calculate_qparams()
             _scale, _zero_point = _scale.to(X.device), _zero_point.to(X.device)
             if not self.init_scales:
@@ -98,6 +181,34 @@ class DualQuantizer(FakeQuantizeBase):
                     self.activation_post_process.quant_min, self.activation_post_process.quant_max)
         return X
 
+    def forward_online(self, X):
+        if self.observer_enabled[0] == 1:
+            data = X.detach()
+            self.activation_post_process(data)
+            _scale, _zero_point = self.calculate_qparams()
+            _scale, _zero_point = _scale.to(X.device), _zero_point.to(X.device)
+            if not self.init_scales:
+                if self.scale.shape != _scale.shape:
+                    self.scale.resize_(_scale.shape)
+                self.scale.copy_(_scale)
+            if self.zero_point.shape != _zero_point.shape:
+                self.zero_point.resize_(_zero_point.shape)
+            self.zero_point.copy_(_zero_point)
+        if self.fake_quant_enabled[0] == 1:
+
+            if self.init_scales:
+                scale = scaled_sigmoid(self.scale, min_val=self.lowest_scale).detach()
+            else:
+                scale = self.scale
+            if self.is_per_channel:
+                X = torch.fake_quantize_per_channel_affine(
+                    X, scale, self.zero_point,
+                    self.ch_axis, self.activation_post_process.quant_min, self.activation_post_process.quant_max)
+            else:
+                X = torch.fake_quantize_per_tensor_affine(
+                    X, scale, self.zero_point,
+                    self.activation_post_process.quant_min, self.activation_post_process.quant_max)
+        return X
     @torch.jit.export
     def extra_repr(self):
         return 'fake_quant_enabled={}, observer_enabled={}, ' \
@@ -146,6 +257,38 @@ class DualQuantizer(FakeQuantizeBase):
                                       missing_keys, unexpected_keys, error_msgs)
 
     def compute_reg_loss(self, X):
+        # if self.quant_min + self.quant_max == 0:
+        X = X.detach()
+        # if self.enhance:
+        #     print(scaled_sigmoid(self.scale, min_val=self.lowest_scale))
+        #     print('1')
+        # if scaled_sigmoid(self.scale, min_val=self.lowest_scale) <= 0.01:
+        #     self.scale.requires_grad = False
+        #X = X.clone().detach()
+        # if X.shape[-1] == 1:
+        #     self.enhance = False
+
+        # if self.quant_min + self.quant_max != 0:
+        #     xshape = X.shape
+        #     slices = [slice(None), slice(None)]  # Keep all elements for the first two axes
+        #     # Calculate slices for remaining axes to take half of the data
+        #     for dim in range(2, len(xshape)):
+        #         size = xshape[dim]
+        #         slices.append(slice(0, size // 2))  # Take half of the data in this axis
+        #     # Use the slicing list to slice the tensor
+        #     X = X[tuple(slices)]
+            # num_channels = X.shape[1]
+            #
+            # # Total number of elements in the tensor
+            # total_elements = X.numel()
+            #
+            # # Number of elements per channel
+            # elements_per_channel = total_elements // num_channels
+            # X = random_sample_channel_wise(X, elements_per_channel // 10)
+        # if self.clip_min:
+        #     X = torch.clamp(X, self.clip_min)
+        # if self.clip_max:
+        #     X = torch.clamp(X, max=self.clip_max)
         if self.is_per_channel:
             ch_axis = self.activation_post_process.ch_axis
             # compute the scale and zero-point per channel
@@ -163,7 +306,40 @@ class DualQuantizer(FakeQuantizeBase):
         else:
             scale = scaled_sigmoid(self.scale, min_val=self.lowest_scale)
             X = X / scale
-            X = X + self.zero_point.float()
+            X = X + self.zero_point
+
+        X_round_num = torch.where(X < self.activation_post_process.quant_min,
+                        0,
+                        torch.where((X >= self.activation_post_process.quant_min) & (
+                                X <= self.activation_post_process.quant_max),
+                                    1,
+                                    0))
+        if self.quant_min + self.quant_max != 0:
+            #pass
+            # if scaled_sigmoid(self.scale, min_val=self.lowest_scale) > 0.1:
+            #     self.enhance = True
+            #pass
+            if self.enhance:
+                ff = self.penalty_factor
+                if len(X.shape) != 1:
+                    round_num_c = sum_except_channel(X_round_num, channel_axis=1)
+                    round_num = round_num_c / torch.max(round_num_c)
+                    penalty = detect_anomaly_normalized(round_num, threshold=self.threshold, scale=ff)
+                    penalty = penalty if penalty > 1 else 1
+                    self.clip_penalty = penalty
+                else:
+                    self.clip_penalty = torch.std(X) *ff
+
+
+        else:
+            if not self.is_per_channel:
+                if self.enhance:
+                    ff = self.penalty_factor
+                    round_num_c = sum_except_channel(X_round_num, channel_axis=0)
+                    round_num = round_num_c/torch.max(round_num_c)
+                    penalty = detect_anomaly_normalized(round_num, threshold=self.threshold, scale=ff)
+                    penalty = penalty if penalty > 1 else 1
+                    self.clip_penalty = penalty
 
         X_clip_left = torch.where(X < self.activation_post_process.quant_min,
                                   (self.quant_min - X),
@@ -172,23 +348,27 @@ class DualQuantizer(FakeQuantizeBase):
                                     0,
                                     0))
 
-
         X_clip_right = torch.where(X < self.activation_post_process.quant_min,
                         0,
                         torch.where((X >= self.activation_post_process.quant_min) & (
                                 X <= self.activation_post_process.quant_max),
                                     0,
                                     (X - self.quant_max)))
-        X_round = torch.where(X < self.activation_post_process.quant_min,
-                        0,
-                        torch.where((X >= self.activation_post_process.quant_min) & (
-                                X <= self.activation_post_process.quant_max),
-                                    (-torch.log(1 - scale)),
-                                    0))
+        #X_clip_right.clamp(max=256)
+
+        X_round = X_round_num * (-torch.log(1 - scale)) * self.clip_penalty
+        #X_round = X_round_num * (-torch.log(1 - scale))*self.clip_penalty
+        # X_round = torch.where(X_ < self.activation_post_process.quant_min,
+        #                 0,
+        #                 torch.where((X_ >= self.activation_post_process.quant_min) & (
+        #                         X_ <= self.activation_post_process.quant_max),
+        #                             (-torch.log(1 - scale))*self.clip_penalty,
+        #                             0))
 
         loss_left = torch.sum(X_clip_left)
         loss_right = torch.sum(X_clip_right)
         loss_round = torch.sum(X_round)
+
         return (loss_right+loss_left)/torch.prod(torch.tensor(X.shape)), loss_round/torch.prod(torch.tensor(X.shape))
 
     def forward_finetune(self, X):
@@ -205,10 +385,18 @@ class DualQuantizer(FakeQuantizeBase):
 
     def init_grad_scaling(self):
         if not self.init_scales:
-            self.scale = torch.clamp(self.scale, self.lowest_scale, 1 - 1e-4)
+            self.scale = torch.clamp(self.scale, self.lowest_scale, 0.5)
+            #self.scale = torch.nn.Parameter(logit(torch.ones(self.scale.shape)*0.009999999), requires_grad=False)
             self.scale = torch.nn.Parameter(logit(self.scale), requires_grad=True)
             self.init_scales = True
-        self.calculate_qparams = self.calculate_running
+            # else:
+            #     self.scale = torch.clamp(self.scale, self.lowest_scale, 1-1e-8)
+            #     self.scale = torch.nn.Parameter(logit(self.scale), requires_grad=True)
+            #     self.init_scales = True
+            #     # else:
+            #     #     self.not_used = True
+            self.forward = self.forward_online
+            self.calculate_qparams = self.calculate_running
 
     def modify_forward(self):
         self.forward = self.forward_finetune
@@ -238,17 +426,30 @@ class DualQuantizer(FakeQuantizeBase):
     def prepare_for_convert(self):
         scale = self.scale.clone().detach()
         del self.scale
-        if self.init_scales:
-            self.register_buffer('scale', torch.tensor(scaled_sigmoid(scale, min_val=self.lowest_scale), dtype=torch.float))
-        else:
-            self.register_buffer('scale', torch.tensor(scale, dtype=torch.float))
+        self.register_buffer('scale', torch.tensor(scaled_sigmoid(scale, min_val=self.lowest_scale), dtype=torch.float))
         if hasattr(self, 'qvalue'):
             self.qvalue = None
         self.init_scales = False
         self.calculate_qparams = self.calculate_saving
         self.forward = self.forward_finetune
 
+    def change_finetune_forward(self):
+        self.calculate_qparams = self.calculate_saving
+        self.forward = self.forward_finetune
+    def change_training_forward(self):
+        self.calculate_qparams = self.calculate_running
+        self.forward = self.forward_online
+    def save_scale_to_list(self):
+        scale = self.scale.clone().detach()
+        self.scale_list.append(scale)
 
+    def switch_scale(self, idx):
+        self.scale.data = self.scale_list[idx].data
+        self.scale.requires_grad = False
+
+    def act_after_weight(self):
+        if self.quant_min + self.quant_max != 0:
+            self.float = False
 def scaled_sigmoid(x, min_val=1e-4, max_val=1 - 1e-4):
     # Standard sigmoid
     sigmoid = torch.sigmoid(x)
@@ -274,9 +475,20 @@ def init_grad_scaling(mod):
 
     """
     if isinstance(mod, DualQuantizer):
-        if mod.not_used == False:
+        if mod.not_used == False and mod.float == False:
             mod.init_grad_scaling()
 
+def init_grad_scaling_act(mod):
+    """
+    Disable fake quantization for this module, if applicable. Example usage::
+
+      # model is any PyTorch model
+      model.apply(torch.ao.quantization.disable_fake_quant)
+
+    """
+    if isinstance(mod, DualQuantizer):
+        if mod.not_used == False and mod.float == False and mod.quant_max + mod.quant_min != 0:
+            mod.init_grad_scaling()
 
 def resume_grad_scaling(mod):
     """
@@ -287,7 +499,7 @@ def resume_grad_scaling(mod):
 
     """
     if isinstance(mod, DualQuantizer):
-        if mod.not_used == False:
+        if mod.not_used == False and mod.float == False:
             mod.resume_grad_scaling()
 
 def min_max_norm(x):
@@ -306,7 +518,7 @@ def enable_fake_quant(mod):
 
     """
     if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
-        if mod.not_used == False:
+        if mod.float == False and mod.not_used == False:
             mod.enable_fake_quant()
 
 
@@ -319,9 +531,25 @@ def disable_fake_quant(mod):
 
     """
     if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
-        if mod.not_used == False:
+        if mod.float == False and mod.not_used == False:
             mod.disable_fake_quant()
 
+def switch_scale(mod, idx):
+    """
+    Disable fake quantization for this module, if applicable. Example usage::
+
+      # model is any PyTorch model
+      model.apply(torch.ao.quantization.disable_fake_quant)
+
+    """
+    if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
+        if mod.not_used == False and mod.float == False:
+            mod.switch_scale(idx)
+
+def save_scale_to_list(mod):
+    if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
+        if mod.not_used == False and mod.float == False:
+            mod.save_scale_to_list()
 
 def enable_observer(mod):
     """
@@ -332,7 +560,7 @@ def enable_observer(mod):
 
     """
     if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
-        if mod.not_used == False:
+        if mod.not_used == False and mod.float == False:
             mod.enable_observer()
 
 
@@ -345,7 +573,7 @@ def disable_observer(mod):
 
     """
     if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
-        if mod.not_used == False:
+        if mod.not_used == False and mod.float == False:
             mod.disable_observer()
 
 
@@ -358,7 +586,7 @@ def disable_grad_scaling(mod):
 
     """
     if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
-        if mod.not_used == False:
+        if mod.not_used == False and mod.float == False:
             mod.disable_grad_scaling()
 
 
@@ -371,8 +599,42 @@ def prepare_for_convert(mod):
 
     """
     if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
-        mod.prepare_for_convert()
+        if mod.not_used == False and mod.float == False and mod.init_scales:
+            mod.prepare_for_convert()
 
+def change_finetune_forward(mod):
+    """
+    Disable fake quantization for this module, if applicable. Example usage::
+
+      # model is any PyTorch model
+      model.apply(torch.ao.quantization.disable_fake_quant)
+
+    """
+    if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
+        mod.change_finetune_forward()
+
+def change_training_forward(mod):
+    """
+    Disable fake quantization for this module, if applicable. Example usage::
+
+      # model is any PyTorch model
+      model.apply(torch.ao.quantization.disable_fake_quant)
+
+    """
+    if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
+        mod.change_training_forward()
+
+def act_after_weight(mod):
+    """
+    Disable fake quantization for this module, if applicable. Example usage::
+
+      # model is any PyTorch model
+      model.apply(torch.ao.quantization.disable_fake_quant)
+
+    """
+    if isinstance(mod, DualQuantizer) or _is_fake_quant_script_module(mod):
+        if mod.not_used == False:
+            mod.act_after_weight()
 
 def _is_fake_quant_script_module(mod):
     ''' Returns true if given mod is an instance of FakeQuantize script module.

@@ -2,14 +2,18 @@ from tinynn.graph.quantization.quantizer import QATQuantizer
 import torch.nn as nn
 import typing
 import queue
+import re
 import torch.nn.intrinsic as nni
 from tinynn.util.train_util import get_logger, get_module_device
 from tinynn.graph.tracer import TraceGraph
 import sys
-from torch.quantization.observer import MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver, MinMaxObserver, PerChannelMinMaxObserver
+import torch
+from torch.quantization.observer import MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver, MinMaxObserver, PerChannelMinMaxObserver, HistogramObserver
 from tinynn.graph.quantization import fused_modules as fm
 from distutils.version import LooseVersion
+import torch.nn.quantized as nnq
 from tinynn.graph.quantization.fake_quantize import FakeQuantizeTFLite
+from tinynn.graph.quantization.quantizer import PostQuantizer, TraceNode, TraceFunction, load_creation_func_names, load_processed_ptq_rules, load_processed_qat_rules, Q_MODULES_MAPPING
 from dual_quant.implementation.core.components.dual_quantizer import DualQuantizer
 from tinynn.graph.quantization.qat_modules import (
     Conv1d,
@@ -17,12 +21,22 @@ from tinynn.graph.quantization.qat_modules import (
     ConvTranspose2d,
     ConvTransposeBn2d,
 )
+import functools
 import torch.nn.quantized.dynamic as nnqd
 import copy
 import torch.quantization as torch_q
 import torch
 
-
+from torch.ao.quantization.quantization_mappings import (
+    get_default_dynamic_quant_module_mappings,
+    get_default_static_quant_module_mappings,
+    get_default_static_quant_reference_module_mappings,
+    get_default_qat_module_mappings,
+    get_default_qconfig_propagation_list,
+    no_observer_set,
+    _has_special_act_post_process,
+    _get_special_act_post_process,
+)
 log = get_logger(__name__, 'WARNING')
 
 try:
@@ -53,10 +67,13 @@ if LooseVersion(torch.__version__) >= '1.13.0':
     FUSE_QAT_MODULES_CUSTOM.update({nn.GRU: GRU})
 
 
-class PingPongwrapper(QATQuantizer):
+class Dualwrapper(QATQuantizer):
     def __init__(self, model, dummy_input, work_dir=None, config=None, extra_param=None):
         super().__init__(model, dummy_input, work_dir, config)
         self.lowest_scale = config['lowest_scale']
+        self.threshold = config['threshold']
+        self.penalty_factor = config['penalty_factor']
+        self.fuse_bn = config['fuse_bn']
 
     def prepare_qconfig(self, graph: TraceGraph, backend: str):
         """Prepare qconfig for various configurations.
@@ -80,12 +97,17 @@ class PingPongwrapper(QATQuantizer):
                     observer=MovingAverageMinMaxObserver,
                     quant_min=0, quant_max=255,
                     lowest_scale=self.lowest_scale,
+                    threshold=self.threshold,
+                    penalty_factor=self.penalty_factor,
                     dtype=torch.quint8, qscheme=torch.per_tensor_affine,
                     reduce_range=False,
                 ),
                 weight=DualQuantizer.with_args(
-                    observer=MovingAverageMinMaxObserver,
+                    observer=MinMaxObserver,
                     quant_min=-127, quant_max=127,
+                    lowest_scale=self.lowest_scale,
+                    threshold=self.threshold,
+                    penalty_factor=self.penalty_factor,
                     dtype=torch.qint8, qscheme=torch.per_tensor_symmetric, reduce_range=False)
             )
         else:
@@ -103,16 +125,16 @@ class PingPongwrapper(QATQuantizer):
             if not self.asymmetric:
                 sym_fq = qconfig.activation.with_args(
                     observer=MovingAverageMinMaxObserver,
-                    quant_min=-128,
-                    quant_max=127,
-                    dtype=torch.qint8,
+                    quant_min=0,
+                    quant_max=255,
+                    dtype=torch.quint8,
                     qscheme=torch.per_tensor_symmetric,
                     reduce_range=False,
                 )
                 qconfig = torch_q.QConfig(sym_fq, qconfig.weight)
             if not self.per_tensor:
                 sym_fq = qconfig.weight.with_args(
-                    observer=PerChannelMinMaxObserver.with_args(quant_min=-128, quant_max=127),
+                    observer=torch_q.PerChannelMinMaxObserver.with_args(quant_min=-127, quant_max=127),
                     quant_min=-127,
                     quant_max=127,
                     dtype=torch.qint8,
@@ -159,6 +181,11 @@ class PingPongwrapper(QATQuantizer):
 
         torch.backends.quantized.engine = actual_backend
         graph.module.qconfig = qconfig
+        from torch.ao.quantization.quantization_mappings import DEFAULT_MODULE_TO_ACT_POST_PROCESS
+
+        # if nn.Sigmoid in DEFAULT_MODULE_TO_ACT_POST_PROCESS:
+        #     DEFAULT_MODULE_TO_ACT_POST_PROCESS[nn.Sigmoid] = qconfig.activation
+
         if self.backend == 'qnnpack':
             if qconfig_c is not None:
                 q = queue.Queue()
@@ -311,13 +338,14 @@ class PingPongwrapper(QATQuantizer):
 
                 orig_no_observer_set = sys.modules['torch.ao.quantization.quantize'].no_observer_set
                 sys.modules['torch.ao.quantization.quantize'].no_observer_set = patch_observer_set(orig_no_observer_set)
-
+                print('added script!')
                 if hasattr(torch_q, 'add_observer_'):
                     add_observer_func = torch_q.add_observer_
                 else:
-                    #add_observer_func = _add_observer_
                     add_observer_func = sys.modules['torch.ao.quantization.quantize']._add_observer_
+                #add_observer_func = _add_observer_
 
+                    #add_observer_func = sys.modules['torch.ao.quantization.quantize']._add_observer_
                 add_observer_func(
                     model,
                     qconfig_propagation_list,
@@ -470,3 +498,322 @@ class PingPongwrapper(QATQuantizer):
                     q.put((next_n, q_mod, state, idx))
 
         return graph.module
+
+
+    def prepare_qat_prep(
+        self,
+        graph: TraceGraph,
+        is_input_quantized: typing.Optional[typing.Tuple[bool]] = None,
+        backend: str = 'qnnpack',
+    ):
+        """Some common logic before calling torch.quantization.prepare[_qat]
+
+        Args:
+            graph (TraceGraph): The computation graph of the model
+            is_input_quantized (typing.Union[typing.Tuple[bool]], optional): Whether the input tensor(s) is (are) \
+                quantized. Defaults to None.
+            backend (str, optional): The backend of quantization. Defaults to 'qnnpack'.
+
+        """
+
+        qat_analysis_queue = queue.Queue()
+        visited = set()
+
+        def _qat_analysis(node: TraceNode, quantized: bool):
+            # Find quantized subgraphs in the whole computation graph
+
+            if node.unique_name in visited:
+                return
+
+            visited.add(node.unique_name)
+
+            if node in graph.output_nodes:
+                return
+
+            # TODO: Enable QAT analysis for TensorRT
+            if self.backend == 'tensorrt':
+                quantized = True
+                node.quantized = True
+            elif type(node.module) is torch_q.QuantStub:
+                quantized = True
+                node.quantized = quantized
+            elif type(node.module) is torch_q.DeQuantStub:
+                node.quantized = True
+                quantized = False
+            else:
+                node.quantized = quantized
+                log.debug(f"[QUANTIZED]{node.unique_name}:{quantized}")
+
+            for i, n in enumerate(node.next_nodes):
+                if type(n.module) == TraceFunction:
+                    if n.kind() in ('shape', 'size', 'dtype', 'device'):
+                        continue
+                    if n.kind() == 'expand_as' and i > 0:
+                        continue
+                qat_analysis_queue.put((n, quantized))
+
+        if is_input_quantized is not None:
+            assert len(is_input_quantized) == len(graph.input_nodes)
+
+            for n, q in zip(graph.input_nodes, is_input_quantized):
+                qat_analysis_queue.put((n, q))
+        else:
+            for n in graph.input_nodes:
+                qat_analysis_queue.put((n, False))
+
+        creation_func_names = load_creation_func_names()
+
+        def _is_extra_constant_nodes(node, custom_data):
+            return node.full_name() in creation_func_names
+
+        extra_constant_nodes = graph.filter_forward_nodes(_is_extra_constant_nodes)
+
+        def _is_params_in_module(node, custom_data):
+            if len(node.prev_nodes) == 1 and len(node.next_nodes) == 1:
+                if len(node.prev_tensors) == 1 and len(node.next_tensors) == 1:
+                    if isinstance(node.prev_tensors[0], nn.Module) and not isinstance(
+                        node.prev_tensors[0], nnq.FloatFunctional
+                    ):
+                        return True
+            return False
+
+        param_nodes = graph.filter_forward_nodes(_is_params_in_module)
+
+        for n in graph.constant_nodes + extra_constant_nodes:
+            qat_analysis_queue.put((n, not torch.is_floating_point(n.next_tensors[0])))
+
+        while not qat_analysis_queue.empty():
+            node, quantized = qat_analysis_queue.get()
+            if not graph.quantized:
+                graph.quantized = graph.quantized or quantized
+            _qat_analysis(node, quantized)
+
+        q_dict = {}
+        for n in graph.forward_nodes:
+            if isinstance(n.module, nn.Module):
+                q_dict[n.module] = q_dict.get(n.module, False) or n.quantized
+
+        for n in graph.forward_nodes:
+            if n.module in q_dict:
+                n.quantized = q_dict[n.module]
+
+        for n in param_nodes:
+            prev_node = n.prev_nodes[0]
+            next_node = n.next_nodes[0]
+            is_known_mod = prev_node.kind().__name__ in (
+                'Conv1d',
+                'Conv2d',
+                'Linear',
+                'ConvTranspose1d',
+                'ConvTranspose2d',
+            )
+            if is_known_mod and n.module.full_name == 'weight' and prev_node.quantized:
+                if next_node.type() == torch_q.QuantStub:
+                    mod = nn.Sequential(torch_q.DeQuantStub(), torch_q.QuantStub())
+                    orig_mod = next_node.module
+                    next_node.module = mod
+                    setattr(graph.module, next_node.original_name, next_node.module)
+                    graph.module_original_name_dict[id(mod)] = graph.module_original_name_dict[id(orig_mod)]
+                    graph.module_unique_name_dict[id(mod)] = graph.module_unique_name_dict[id(orig_mod)]
+                continue
+            qat_analysis_queue.put((n, not torch.is_floating_point(n.next_tensors[0])))
+
+        while not qat_analysis_queue.empty():
+            node, quantized = qat_analysis_queue.get()
+            if not graph.quantized:
+                graph.quantized = graph.quantized or quantized
+            _qat_analysis(node, quantized)
+
+        log.debug("qat analysis over")
+
+        if not graph.quantized:
+            return
+
+        if isinstance(self, PostQuantizer):
+            processed_rules = load_processed_ptq_rules()
+        else:
+            processed_rules = load_processed_qat_rules()
+
+        is_fusable = functools.partial(self.is_fusable, current_rules=processed_rules, graph=graph)
+
+        def _find_quantized_module_nodes(node: TraceNode, custom_node):
+            # Find quantized module nodes
+            return node.type() in Q_MODULES_MAPPING and node.quantized
+
+        # Replace module nodes with our custom variants
+        quantized_mod_nodes = graph.filter_forward_nodes(_find_quantized_module_nodes)
+
+        type_dict = {}
+        for node in quantized_mod_nodes:
+            node_type = node.type()
+            type_dict.setdefault(node_type, [])
+            type_dict[node_type].append(node)
+
+        for node_type, nodes in type_dict.items():
+            graph.update_submodule_in_nodes_from_predicate(nodes, Q_MODULES_MAPPING[node_type], self.inplace)
+
+        custom_data = ([], set())
+        graph.filter_forward_nodes(is_fusable, custom_data, reverse=True)
+        quant_list = custom_data[0]
+        log.info(f'found nodes to fuse: {quant_list}')
+
+        new_fuser_func = fm.gen_fuse_known_modules_wrapper(
+            sys.modules['torch.quantization.fuse_modules'].fuse_known_modules
+        )
+        if self.fuse_bn:
+            if self.backend != 'tensorrt':
+                is_qat = type(self) is QATQuantizer
+                for quant_nodes in quant_list:
+                    if self.inplace:
+                        quant_nodes = [re.sub('get_submodule\\("(.*?)"\\)', '\\1', x) for x in quant_nodes]
+                        quant_nodes = [re.sub('\\[("|)(.*?)("|)\\]', '.\\2', x) for x in quant_nodes]
+
+                    if LooseVersion(torch.__version__) >= '1.11.0' and LooseVersion(torch.__version__) < '1.14.0':
+                        # See https://github.com/pytorch/pytorch/pull/88193
+                        sys.modules['torch.quantization.fuse_modules']._fuse_modules(
+                            graph.module, quant_nodes, is_qat=is_qat, inplace=True, fuser_func=new_fuser_func
+                        )
+                    elif is_qat and LooseVersion(torch.__version__) >= '1.14.0':
+                        # See https://github.com/pytorch/pytorch/issues/74028
+                        torch.ao.quantization.fuse_modules_qat(
+                            graph.module, quant_nodes, fuser_func=new_fuser_func, inplace=True
+                        )
+                    else:
+                        torch_q.fuse_modules(graph.module, quant_nodes, fuser_func=new_fuser_func, inplace=True)
+
+        self.prepare_qconfig(graph, backend)
+        self.override_qconfig(graph.module)
+
+# def _add_observer_(module, qconfig_propagation_list=None, non_leaf_module_list=None, device=None, custom_module_class_mapping=None):
+#     r"""Add observer for the leaf child of the module.
+#
+#     This function insert observer module to all leaf child module that
+#     has a valid qconfig attribute.
+#
+#     Args:
+#         module: input module with qconfig attributes for all the leaf modules that we want to quantize
+#         qconfig_propagation_list: a list of quantizable modules that will have observers added to them
+#             if they are leaf nodes
+#         device: parent device, if any
+#         non_leaf_module_list: list of non-leaf modules we want to add observer
+#
+#     Return:
+#         None, module is modified inplace with added observer modules and forward_hooks
+#     """
+#     if qconfig_propagation_list is None:
+#         qconfig_propagation_list = get_default_qconfig_propagation_list()
+#
+#     if custom_module_class_mapping is None:
+#         custom_module_class_mapping = {}
+#
+#     # respect device affinity when adding observers
+#     def _get_unique_devices_(module):
+#         return {p.device for p in module.parameters()} | \
+#             {p.device for p in module.buffers()}
+#     if device is None:
+#         devices = _get_unique_devices_(module)
+#         assert len(devices) <= 1, (
+#             f"_add_observer_ only works with cpu or single-device CUDA modules, but got devices {devices}"
+#         )
+#         device = next(iter(devices)) if len(devices) > 0 else None
+#
+#     def get_activation_post_process(qconfig, device, special_act_post_process=None):
+#         activation = qconfig.activation() if special_act_post_process is None else special_act_post_process()
+#         if device is not None:
+#             activation.to(device)
+#         return activation
+#
+#     def needs_observation(m):
+#         return hasattr(m, 'qconfig') and m.qconfig is not None
+#
+#     def insert_activation_post_process(m, special_act_post_process=None):
+#         """ Adds an activation post process module and register
+#         a pre or post hook that calls the module
+#         """
+#         # We don't insert observer/fake_quantize for DeQuantStub
+#         from torch.ao.quantization.stubs import DeQuantStub, QuantWrapper
+#         def _observer_forward_hook(self, input, output):
+#             r"""Forward hook that calls observer on the output
+#             """
+#             return self.activation_post_process(output)
+#
+#         def _observer_forward_pre_hook(self, input):
+#             r"""Forward pre hook that calls observer on the output
+#             """
+#             return self.activation_post_process(input[0])
+#         from torch.quantization.qconfig import QConfig
+#         from torch.quantization.fake_quantize import FakeQuantizeBase
+#         def _activation_is_memoryless(qconfig: QConfig):
+#             """
+#             Return whether the observer for activations defined in the given QConfig is memoryless.
+#             This means a MovingAverage observer with averaging constant equal to 1.
+#             """
+#
+#             def _is_memoryless(observer):
+#                 return hasattr(observer, "averaging_constant") and observer.averaging_constant == 1
+#
+#             act = qconfig.activation()
+#             if isinstance(act, FakeQuantizeBase) and hasattr(act, "activation_post_process"):
+#                 return _is_memoryless(act.activation_post_process)
+#             else:
+#                 return _is_memoryless(act)
+#
+#         def _register_activation_post_process_hook(module, pre_hook=False):
+#             assert hasattr(module, 'activation_post_process'), \
+#                 'Expect activation_post_process attribute already attached to the module'
+#             if pre_hook:
+#                 handle = module.register_forward_pre_hook(
+#                     _observer_forward_pre_hook#, prepend=True
+#                 )
+#             else:
+#                 handle = module.register_forward_hook(
+#                     _observer_forward_hook#, prepend=True
+#                 )
+#         if needs_observation(m) and not isinstance(m, DeQuantStub):
+#             # observer and hook will be gone after we swap the module
+#             m.add_module('activation_post_process', get_activation_post_process(
+#                 m.qconfig, device, special_act_post_process))
+#             # Register observer as the first entry in the hook list
+#             # All post forward hooks are preserved and will be executed after the observer before convert
+#             _register_activation_post_process_hook(m, pre_hook=_activation_is_memoryless(m.qconfig))
+#
+#     from torch.nn.utils.parametrize import type_before_parametrizations
+#     import torch.ao.nn.quantized as nnq
+#     from torch.ao.nn.intrinsic import _FusedModule
+#     for name, child in module.named_children():
+#         # TODO remove Dropout special after codebase stable
+#         if type_before_parametrizations(child) in [nn.Dropout]:
+#             continue
+#         elif issubclass(type_before_parametrizations(child), (nnq.FloatFunctional, nnq.QFunctional)):
+#             if needs_observation(child):
+#                 assert hasattr(child, "activation_post_process"), (
+#                     f"functional class {type_before_parametrizations(child)} has no pre-defined `activation_post_process`"
+#                 )
+#                 child.activation_post_process = get_activation_post_process(child.qconfig, device)
+#         elif isinstance(child, _FusedModule):
+#             # activation_post_process are now added directly to nn.Sequential/_FusedModule
+#             if needs_observation(child):
+#                 insert_activation_post_process(child)
+#         elif non_leaf_module_list is not None and type_before_parametrizations(child) in non_leaf_module_list:
+#             if needs_observation(child):
+#                 insert_activation_post_process(child)
+#         elif _has_special_act_post_process(child):
+#             #special_act_post_process = _get_special_act_post_process(child)
+#             #insert_activation_post_process(child, special_act_post_process)
+#             insert_activation_post_process(child)
+#         elif needs_observation(child) and type_before_parametrizations(child) in custom_module_class_mapping:
+#             observed_child = custom_module_class_mapping[type_before_parametrizations(child)].from_float(child)
+#             setattr(module, name, observed_child)
+#             # TODO: These are the modules that cannot be observed
+#             #       Once there are more, we should move them to a separate list
+#             if custom_module_class_mapping[type_before_parametrizations(child)] not in no_observer_set():
+#                 insert_activation_post_process(observed_child)
+#         else:
+#             _add_observer_(child, qconfig_propagation_list, non_leaf_module_list, device, custom_module_class_mapping)
+#
+#     # Insert observers only for leaf nodes, note that this observer is for
+#     # the output of the module, for input QuantStub will observe them
+#     from torch.ao.quantization.utils import get_qparam_dict, has_no_children_ignoring_parametrizations
+#     if has_no_children_ignoring_parametrizations(module) and not isinstance(module, torch.nn.Sequential) \
+#        and type_before_parametrizations(module) in qconfig_propagation_list:
+#         insert_activation_post_process(module)
