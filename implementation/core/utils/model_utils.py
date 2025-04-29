@@ -3,7 +3,7 @@ import torch.nn as nn
 import tinynn
 from dual_quant.implementation.core.components.tiny_nn_dual_wrapper import Dualwrapper
 from dual_quant.implementation.core.components.dual_quantizer import DualQuantizer
-from torch.quantization.quantize_fx import fuse_fx
+
 
 
 def change_clip_range(quant_model):
@@ -59,7 +59,6 @@ def get_insert_fake_quant_model(model, dummy_input, per_tensor=True, lowest_scal
                                 not_quantize_layers=[], special_layers=[], only_min_max_layers=[]):
 
     model.eval()
-    model = fuse_fx(model)
     replace_inplace(model)
     path = output_dir
     if not per_tensor:
@@ -133,7 +132,6 @@ def get_insert_fake_quant_model(model, dummy_input, per_tensor=True, lowest_scal
                     module.apply(torch.ao.quantization.enable_observer)
                 else:
                     module.apply(torch.ao.quantization.disable_fake_quant)
-                    module.apply(torch.ao.quantization.disable_observer)
                     if isinstance(module, DualQuantizer):
                         module.not_used = True
                         module.record = False
@@ -144,7 +142,6 @@ def get_insert_fake_quant_model(model, dummy_input, per_tensor=True, lowest_scal
             for module in quant_model._modules[name].modules():
                 if isinstance(module, DualQuantizer):
                     module.apply(torch.ao.quantization.disable_fake_quant)
-                    module.apply(torch.ao.quantization.disable_observer)
                     module.not_used = True
                     module.record = False
 

@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision
+from torch.quantization.quantize_fx import fuse_fx
 from dual_quant.implementation.core.utils.model_utils import get_insert_fake_quant_model
 from dual_quant.implementation.core.utils.training_utils import make_ptq_training
 class RandomDataset(Dataset):
@@ -29,6 +30,7 @@ class RandomDataset(Dataset):
 # Example usage:
 if __name__ == "__main__":
     model = torchvision.models.mobilenet_v2(pretrained=True)
+    model = fuse_fx(model)
     input_shape = (5, 3, 56, 56)
     # 1,000 samples of 3×224×224 images, with 10 possible classes
     dataset = RandomDataset(num_samples=1000, input_size=(3, 56, 56))
