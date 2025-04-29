@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
 import tinynn
-import timm
 from dual_quant.implementation.core.components.tiny_nn_dual_wrapper import Dualwrapper
 from dual_quant.implementation.core.components.dual_quantizer import DualQuantizer
-from dual_quant.implementation.core.components.dual_quantizer import prepare_for_convert, init_grad_scaling, \
-    disable_grad_scaling
+from torch.quantization.quantize_fx import fuse_fx
 
 
 def change_clip_range(quant_model):
@@ -57,10 +55,17 @@ def replace_inplace(model):
             replace_inplace(child)
 
 
-def get_insert_fake_quant_model(model, dummy_input, config, only_min_max=False, activation_only=False, output_dir='quant_out', enable_act=False, weights_only=False, ignore_layer_names=[], only_quantize_layers=[],
+def get_insert_fake_quant_model(model, dummy_input, per_tensor=True, lowest_scale=1e-4, only_min_max=False, activation_only=False, output_dir='quant_out', enable_act=False, weights_only=False, ignore_layer_names=[], only_quantize_layers=[],
                                 not_quantize_layers=[], special_layers=[], only_min_max_layers=[]):
+
+    model.eval()
+    model = fuse_fx(model)
     replace_inplace(model)
     path = output_dir
+    if not per_tensor:
+        cat = True
+    else:
+        cat = False
     quantizer = Dualwrapper(
         model,
         dummy_input,
@@ -68,13 +73,11 @@ def get_insert_fake_quant_model(model, dummy_input, config, only_min_max=False, 
         config={
             'asymmetric': True,
             'backend': 'qnnpack',
-            "disable_requantization_for_cat": False,
+            "disable_requantization_for_cat": cat,
             'set_quantizable_op_stats': True,
             'fuse_bn': True,
-            'per_tensor': not config['per_channel'],
-            'lowest_scale': config['lowest_scale'],
-            'threshold': config['threshold'],
-            'penalty_factor': config['penalty_factor'],
+            'per_tensor': per_tensor,
+            'lowest_scale': lowest_scale,
         }
     )
 

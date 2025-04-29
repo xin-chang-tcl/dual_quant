@@ -68,12 +68,12 @@ if LooseVersion(torch.__version__) >= '1.13.0':
 
 
 class Dualwrapper(QATQuantizer):
-    def __init__(self, model, dummy_input, work_dir=None, config=None, extra_param=None):
+    def __init__(self, model, dummy_input, fuse_bn=True, threshold=0.9, penalty_factor=0.05, work_dir=None, config=None, extra_param=None):
         super().__init__(model, dummy_input, work_dir, config)
         self.lowest_scale = config['lowest_scale']
-        self.threshold = config['threshold']
-        self.penalty_factor = config['penalty_factor']
-        self.fuse_bn = config['fuse_bn']
+        self.threshold = threshold
+        self.penalty_factor = penalty_factor
+        self.fuse_bn = fuse_bn
 
     def prepare_qconfig(self, graph: TraceGraph, backend: str):
         """Prepare qconfig for various configurations.
